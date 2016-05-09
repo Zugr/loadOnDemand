@@ -1,207 +1,242 @@
 ﻿/*global angular*/
-(function () {
+(function (ng) {
     'use strict';
-    var regModules = ["ng"];
-    
-    var aModule = angular.module('loadOnDemand', []);
+    var aModule = ng.module('loadOnDemand', []);
 
     aModule.factory('scriptCache', ['$cacheFactory', function ($cacheFactory) {
-        return $cacheFactory('scriptCache', {
-            capacity: 10
-        });
-    } ]);
+        return $cacheFactory('scriptCache', {capacity: 10});
+    }]);
 
     aModule.provider('$loadOnDemand',
         ['$controllerProvider', '$provide', '$compileProvider', '$filterProvider',
             function ($controllerProvider, $provide, $compileProvider, $filterProvider) {
-                
-                var modules = { },
+                var regModules = {ng: true};
+                var modules = {},
                     providers = {
                         $controllerProvider: $controllerProvider,
                         $compileProvider: $compileProvider,
                         $filterProvider: $filterProvider,
                         $provide: $provide // other things
                     };
-                this.$get = ['scriptCache', '$timeout', '$log', '$document', '$injector',
-                    function (scriptCache, $timeout, $log, $document, $injector) {
+                this.$get = ['scriptCache', '$log', '$document', '$injector', '$q', '$rootScope',
+                    function (scriptCache, $log, $document, $injector, $q, $rootScope) {
                         return {
                             getConfig: function (name) {
-                                if (!modules[name]) {
-                                    return null;
-                                }
                                 return modules[name];
                             },
-                            load: function (name, callback) {
+                            load: function (name) {
                                 var self = this,
-                                    config = self.getConfig(name),
-                                    resourceId = 'script:' + config.script,
-                                    moduleCache = [];
-                                moduleCache.push = function (value) {
-                                    if (this.indexOf(value) == -1) {
-                                        Array.prototype.push.apply(this, arguments);
-                                    }
-                                };
-                                if (!config) {
-                                    var errorText = 'Module "' + name + '" not configured';
-                                    $log.error(errorText);
-                                    throw errorText;
-                                }
+                                    moduleCache = {};
+                                return self.getConfig(name) ?
+                                    loadScript(name) :
+                                    $q.reject(new Error('Module "' + name + '" not configured'));
 
-                                function loadScript(url, onLoadScript) {
-                                    var scriptId = 'script:' + url,
-                                        scriptElement;
-                                    if (!scriptCache.get(scriptId)) {
-                                        scriptElement = $document[0].createElement('script');
-                                        scriptElement.src = url;
-                                        scriptElement.onload = onLoadScript;
-                                        scriptElement.onerror = function () {
-                                            $log.error('Error loading "' + url + '"');
-                                            scriptCache.remove(scriptId);
-                                        };
-                                        $document[0].documentElement.appendChild(scriptElement);
-                                        scriptCache.put(scriptId, 1);
-                                    } else {
-                                        $timeout(onLoadScript);
+                                function loadScript(requireModule) {
+                                    var requireModuleConfig = self.getConfig(requireModule);
+                                    if (!requireModuleConfig) {
+                                        return $q.reject(new Error('module "' + requireModule + '" not loaded and not configured'));
                                     }
-                                }
-
-                                function loadDependencies(moduleName, allDependencyLoad) {
-                                    if (regModules.indexOf(moduleName) > -1) {
-                                        return allDependencyLoad();
+                                    var resourceId = 'script:' + requireModuleConfig.script;
+                                    var script = scriptCache.get(resourceId);
+                                    if (!script) {
+                                        script = download()
+                                            .then(loadDependencies)
+                                            .then(null, function (e) {
+                                                scriptCache.remove(resourceId);
+                                                if (e.message) {
+                                                    e.message += ' from module "' + requireModule + '"'
+                                                }
+                                                $log.error(e);
+                                            });
+                                        scriptCache.put(resourceId, script);
                                     }
-                                    var loadedModule = angular.module(moduleName),
-                                        requires = getRequires(loadedModule);
-                                    
-                                    function onModuleLoad(moduleLoaded) {
-                                        if (moduleLoaded) {
+                                    return script;
 
-                                            var index = requires.indexOf(moduleLoaded);
-                                            if (index > -1) {
-                                                requires.splice(index, 1);
+                                    function download() {
+                                        var deferred = $q.defer();
+                                        try {
+                                            var url = requireModuleConfig.script;
+                                            var scriptElement = $document[0].createElement('script');
+                                            scriptElement.src = url;
+                                            scriptElement.onload = function () {
+                                                deferred.resolve();
+                                                $rootScope.$apply();
+                                            };
+                                            scriptElement.onerror = function () {
+                                                deferred.reject(new Error('Error loading "' + url + '"'));
+                                            };
+                                            $document[0].documentElement.appendChild(scriptElement);
+                                        }
+                                        catch (e) {
+                                            deferred.reject(e);
+                                        }
+                                        return deferred.promise;
+                                    }
+
+                                    function loadDependencies() {
+                                        var moduleName = requireModuleConfig.name;
+                                        if (regModules[moduleName]) {
+                                            return $q.when(moduleName);
+                                        }
+                                        var loadedModule = ng.module(moduleName);
+                                        var requirePromises = [];
+                                        ng.forEach(loadedModule.requires, function (requireModule) {
+                                            if (!regModules[requireModule]) {
+                                                if (moduleExists(requireModule)) {
+                                                    regModules[requireModule] = true;
+                                                }
+                                                else {
+                                                    if (!moduleCache[requireModule]) {
+                                                        moduleCache[requireModule] = loadScript(requireModule);
+                                                    }
+                                                    requirePromises.push(moduleCache[requireModule]);
+                                                }
                                             }
-                                        }
-                                        if (requires.length === 0) {
-                                            $timeout(function () {
-                                                allDependencyLoad(moduleName);
-                                            });
-                                        }
-                                    }
-
-                                    var requireNeeded = getRequires(loadedModule);
-                                    angular.forEach(requireNeeded, function (requireModule) {
-                                        moduleCache.push(requireModule);
-                                        
-                                        if (moduleExists(requireModule)) {
-                                            return onModuleLoad(requireModule);
-                                        }
-                                        
-                                        var requireModuleConfig = self.getConfig(requireModule);
-                                        if (requireModuleConfig) {
-                                            loadScript(requireModuleConfig.script, function() {
-                                                loadDependencies(requireModule, function requireModuleLoaded(name) {
-                                                    onModuleLoad(name);
-                                                });
-                                            });
-                                        } else {
-                                            $log.warn('module "' + requireModule + "' not loaded and not configured");
-                                            onModuleLoad(requireModule);
-                                        }
-                                        return null;
-                                    });
-
-                                    if (requireNeeded.length == 0) {
-                                        onModuleLoad();
-                                    }
-                                    return null;
-                                }
-
-                                if (!scriptCache.get(resourceId)) {
-                                    loadScript(config.script, function () {
-                                        moduleCache.push(name);
-                                        loadDependencies(name, function () {
-                                            register($injector, providers, moduleCache);
-                                            $timeout(function () {
-                                                callback(false);
-                                            });
                                         });
-
-                                    });
-                                } else {
-                                    $timeout(function () {
-                                        callback(true);
-                                    });
+                                        return $q.all(requirePromises).then(function () {
+                                            register($injector, moduleName);
+                                            regModules[moduleName] = true;
+                                        });
+                                    }
                                 }
                             }
                         };
                     }];
+
                 this.config = function (config) {
-                    init(angular.element(window.document));
-                    if (angular.isArray(config)) {
-                        angular.forEach(config, function (moduleConfig) {
+                    init(ng.element(window.document));
+                    if (ng.isArray(config)) {
+                        ng.forEach(config, function (moduleConfig) {
                             modules[moduleConfig.name] = moduleConfig;
                         });
                     } else {
                         modules[config.name] = config;
                     }
                 };
+
+                function register($injector, moduleName) {
+                    var moduleFn = ng.module(moduleName);
+                    ng.forEach(moduleFn._invokeQueue, function (invokeArgs) {
+                        if (!providers.hasOwnProperty(invokeArgs[0])) {
+                            throw new Error('unsupported provider ' + invokeArgs[0]);
+                        }
+                        var provider = providers[invokeArgs[0]];
+                        provider[invokeArgs[1]].apply(provider, invokeArgs[2]);
+                    });
+                    ng.forEach(moduleFn._runBlocks, function (fn) {
+                        $injector.invoke(fn);
+                    });
+                }
+
+                function moduleExists(moduleName) {
+                    try {
+                        ng.module(moduleName);
+                    } catch (e) {
+                        if (/No module/.test(e) || (e.message.indexOf('$injector:nomod') > -1)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+
+                function init(element) {
+                    var elements = [element],
+                        isReg = false,
+                        names = ['ng:app', 'ng-app', 'x-ng-app', 'data-ng-app'],
+                        NG_APP_CLASS_REGEXP = /\sng[:\-]app(:\s*([\w\d_]+);?)?\s/;
+
+                    function append(elm) {
+                        return elm && elements.push(elm);
+                    }
+
+                    ng.forEach(names, function (name) {
+                        names[name] = true;
+                        append(document.getElementById(name));
+                        name = name.replace(':', '\\:');
+                        if (element.querySelectorAll) {
+                            ng.forEach(element.querySelectorAll('.' + name), append);
+                            ng.forEach(element.querySelectorAll('.' + name + '\\:'), append);
+                            ng.forEach(element.querySelectorAll('[' + name + ']'), append);
+                        }
+                    });
+
+                    ng.forEach(elements, function (elm) {
+                        if (!isReg) {
+                            var className = ' ' + element.className + ' ';
+                            var match = NG_APP_CLASS_REGEXP.exec(className);
+                            if (match) {
+                                isReg = addReg((match[2] || '').replace(/\s+/g, ','));
+                            } else {
+                                ng.forEach(elm.attributes, function (attr) {
+                                    if (!isReg && names[attr.name]) {
+                                        isReg = addReg(attr.value);
+                                    }
+                                });
+                            }
+                        }
+                    });
+
+                    function addReg(module) {
+                        if (!regModules[module]) {
+                            regModules[module] = true;
+                            var mainModule = ng.module(module);
+                            ng.forEach(mainModule.requires, addReg);
+                        }
+                        return regModules[module];
+                    }
+                }
             }]);
 
-    aModule.directive('loadOnDemand', ['$http', 'scriptCache', '$log', '$loadOnDemand', '$compile', '$timeout',
-        function ($http, scriptCache, $log, $loadOnDemand, $compile, $timeout) {
+    aModule.directive('loadOnDemand', ['$http', 'scriptCache', '$log', '$loadOnDemand', '$compile', '$q',
+        function ($http, scriptCache, $log, $loadOnDemand, $compile, $q) {
             return {
                 link: function (scope, element, attr) {
-                    var srcExp = attr.loadOnDemand,
-                        childScope;
+                    var currentName;
+                    var clearContent = ng.noop;
 
-                    function clearContent() {
-                        if (childScope) {
-                            childScope.$destroy();
-                            childScope = null;
-                        }
-                        element.html('');
-                    }
-
-                    function loadTemplate(url, callback) {
-                        var resourceId = 'view:' + url,
-                            view;
-                        if (!scriptCache.get(resourceId)) {
-                            $http.get(url).
-                                success(function(data) {
-                                    scriptCache.put(resourceId, data);
-                                    callback(data);
-                                })
-                                .error(function(data) {
-                                    $log.error('Error load template "' + url + "': " + data);
-                                });
-                        } else {
-                            view = scriptCache.get(resourceId);
-                            $timeout(function() {
-                                callback(view);
-                            }, 0);
-                        }
-                    }
-
-                    scope.$watch(srcExp, function(moduleName) {
+                    function loadTemplate(moduleName) {
                         var moduleConfig = $loadOnDemand.getConfig(moduleName);
-
-                        if (moduleName) {
-                            $loadOnDemand.load(moduleName, function() {
-                                if (!moduleConfig.template) {
-                                    return;
-                                }
-                                loadTemplate(moduleConfig.template, function(template) {
-
-                                    childScope = scope.$new();
-                                    element.html(template);
-
-                                    var content = element.contents(),
-                                        linkFn = $compile(content);
-
-                                    linkFn(childScope);
+                        if (!moduleConfig.template) {
+                            return $q.reject(null);
+                        }
+                        var resourceId = 'view:' + moduleConfig.template;
+                        var template = scriptCache.get(resourceId);
+                        if (!template) {
+                            template = $http.get(moduleConfig.template).
+                                then(function (data) {
+                                    return data.data;
+                                }, function (data) {
+                                    $log.error('Error load template "' + moduleConfig.template + "': " + data);
+                                    return $q.reject(data.data);
                                 });
+                            scriptCache.put(resourceId, template);
+                        }
+                        return template;
+                    }
 
-                            });
-                        } else {
+                    scope.$watch(attr.loadOnDemand, function (moduleName) {
+                        currentName = moduleName;
+                        if (moduleName) {
+                            $loadOnDemand.load(moduleName)
+                                .then(function () {
+                                    return loadTemplate(moduleName)
+                                        .then(function (template) {
+                                            if (currentName === moduleName) {
+                                                clearContent();
+                                                var childScope = scope.$new();
+                                                element.html(template);
+                                                $compile(element.contents())(childScope);
+                                                clearContent = function() {
+                                                    childScope.$destroy();
+                                                    element.html('');
+                                                    clearContent = ng.noop;
+                                                }
+                                            }
+                                        });
+
+                                });
+                        }
+                        else {
                             clearContent();
                         }
                     });
@@ -209,112 +244,5 @@
                 }
             };
         }]);
-    
-    function getRequires(module) {
-        var requires = [];
-        angular.forEach(module.requires, function (requireModule) {
-            if (regModules.indexOf(requireModule) == -1) {
-                requires.push(requireModule);
-            }
-        });
-        return requires;
-    }
-    function moduleExists(moduleName) {
-        try {
-            angular.module(moduleName);
-        } catch (e) {
-            if (/No module/.test(e)) {
-                return false;
-            }
-        }
-        return true;
-    }
-    function register($injector, providers, registerModules) {
-        var i, ii, k, invokeQueue, moduleName, moduleFn, invokeArgs, provider;
-        if (registerModules) {
-            var runBlocks = [];
-            for (k = registerModules.length-1; k >= 0; k--) {
-                moduleName = registerModules[k];
-                regModules.push(moduleName);
-                moduleFn = angular.module(moduleName);
-                runBlocks = runBlocks.concat(moduleFn._runBlocks);
-                try {
-                    for (invokeQueue = moduleFn._invokeQueue, i = 0, ii = invokeQueue.length; i < ii; i++) {
-                        invokeArgs = invokeQueue[i];
 
-                        if (providers.hasOwnProperty(invokeArgs[0])) {
-                            provider = providers[invokeArgs[0]];
-                        } else {
-                            return $log.error("unsupported provider " + invokeArgs[0]);
-                        }
-                        provider[invokeArgs[1]].apply(provider, invokeArgs[2]);
-                    }
-                } catch (e) {
-                    if (e.message) {
-                        e.message += ' from ' + moduleName;
-                    }
-                    $log.error(e.message);
-                    throw e;
-                }
-                registerModules.pop();
-            }
-            angular.forEach(runBlocks, function(fn) {
-                $injector.invoke(fn);
-            });
-        }
-        return null;
-    }
-    
-    function init(element) {
-        var elements = [element],
-            appElement,
-            module,
-            names = ['ng:app', 'ng-app', 'x-ng-app', 'data-ng-app'],
-            NG_APP_CLASS_REGEXP = /\sng[:\-]app(:\s*([\w\d_]+);?)?\s/;
-
-        function append(elm) {
-            elm && elements.push(elm);
-        }
-
-        angular.forEach(names, function (name) {
-            names[name] = true;
-            append(document.getElementById(name));
-            name = name.replace(':', '\\:');
-            if (element.querySelectorAll) {
-                angular.forEach(element.querySelectorAll('.' + name), append);
-                angular.forEach(element.querySelectorAll('.' + name + '\\:'), append);
-                angular.forEach(element.querySelectorAll('[' + name + ']'), append);
-            }
-        });
-
-        angular.forEach(elements, function (elm) {
-            if (!appElement) {
-                var className = ' ' + element.className + ' ';
-                var match = NG_APP_CLASS_REGEXP.exec(className);
-                if (match) {
-                    appElement = elm;
-                    module = (match[2] || '').replace(/\s+/g, ',');
-                } else {
-                    angular.forEach(elm.attributes, function (attr) {
-                        if (!appElement && names[attr.name]) {
-                            appElement = elm;
-                            module = attr.value;
-                        }
-                    });
-                }
-            }
-        });
-        if (appElement) {
-            (function addReg(module) {
-                if (regModules.indexOf(module) == -1) {
-                    regModules.push(module);
-                    var mainModule = angular.module(module);
-                    angular.forEach(mainModule.requires, addReg);
-                }
-            })(module);
-        }
-    }
-
-})();
-
-
+})(angular);
